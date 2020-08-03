@@ -3,17 +3,21 @@ package http
 import (
 	"bytes"
 	"crypto/x509/pkix"
+	"encoding/base64"
 	"encoding/gob"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"github.com/duo-labs/webauthn/protocol"
 	"github.com/duo-labs/webauthn/protocol/webauthncose"
 	"github.com/duo-labs/webauthn/webauthn"
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
 	"github.com/reinkrul/go-webauthn-certificate/ca"
+	"github.com/reinkrul/go-webauthn-certificate/pdf"
 	"github.com/reinkrul/go-webauthn-certificate/users"
+	uuid "github.com/satori/go.uuid"
 	"github.com/sirupsen/logrus"
 	"log"
 	"net"
@@ -28,9 +32,10 @@ type RegistrationRequest struct {
 
 func NewHTTPServer(name string, users users.Repository, ca ca.CertificateAuthority) (HTTPServer, error) {
 	server := httpServer{
-		address: "localhost:8080",
-		users:   users,
-		ca:      ca,
+		address:             "localhost:8080",
+		users:               users,
+		ca:                  ca,
+		signingTransactions: make(map[string]*pdf.OutOfBandPDFSigner, 0),
 	}
 	if host, _, err := net.SplitHostPort(server.address); err != nil {
 		return nil, err
@@ -52,11 +57,12 @@ type HTTPServer interface {
 }
 
 type httpServer struct {
-	address  string
-	users    users.Repository
-	ca       ca.CertificateAuthority
-	webAuthn *webauthn.WebAuthn
-	sessions sessions.Store
+	address             string
+	users               users.Repository
+	ca                  ca.CertificateAuthority
+	signingTransactions map[string]*pdf.OutOfBandPDFSigner
+	webAuthn            *webauthn.WebAuthn
+	sessions            sessions.Store
 }
 
 func (h *httpServer) Start() {
@@ -64,10 +70,15 @@ func (h *httpServer) Start() {
 
 	gob.Register(webauthn.SessionData{})
 	r := mux.NewRouter()
+	// Registration
 	r.HandleFunc("/registration", h.beginRegistration).Methods("POST")
 	r.HandleFunc("/registration/{id}", h.finishRegistration).Methods("POST")
 	//r.HandleFunc("/login/start/{username}", BeginLogin).Methods("POST")
 	//r.HandleFunc("/login/finish/{username}", FinishLogin).Methods("POST")
+	// Signing
+	r.HandleFunc("/user/{id}/sign", h.startSign).Methods("POST")
+	r.HandleFunc("/user/{id}/sign/{transaction}", h.setSignature).Methods("POST")
+	// Meta
 	r.HandleFunc("/user/{id}/certificate", h.getCertificate).Methods("GET")
 	r.PathPrefix("/").Handler(http.FileServer(http.Dir("./web")))
 
@@ -105,13 +116,9 @@ func (h *httpServer) beginRegistration(response http.ResponseWriter, request *ht
 }
 
 func (h *httpServer) finishRegistration(response http.ResponseWriter, request *http.Request) {
-	vars := mux.Vars(request)
-	var user users.User
-	if id, err := users.UserIDFromString(vars["id"]); err != nil {
-		handleError(response, fmt.Errorf("missing/invalid id: %w", err))
+	user := h.getUserFromRequest(response, request)
+	if user == nil {
 		return
-	} else {
-		user = h.users.Get(id)
 	}
 
 	var sessionData webauthn.SessionData
@@ -153,22 +160,105 @@ func (h *httpServer) issueCertificate(user users.User, credential *webauthn.Cred
 }
 
 func (h *httpServer) getCertificate(response http.ResponseWriter, request *http.Request) {
-	vars := mux.Vars(request)
-	var user users.User
-	if id, err := users.UserIDFromString(vars["id"]); err != nil {
-		handleError(response, fmt.Errorf("missing/invalid id: %w", err))
+	user := h.getUserFromRequest(response, request)
+	if user == nil {
 		return
-	} else {
-		user = h.users.Get(id)
 	}
 	pemAsBytes := pem.EncodeToMemory(&pem.Block{
 		Type:  "CERTIFICATE",
 		Bytes: user.GetCertificate().Raw,
 	})
-	response.Header().Add("Content-Type", "application/x-pem-file")
-	response.Header().Add("Content-Disposition", `attachment;filename="` + user.WebAuthnDisplayName() + `.pem"`)
+	marshalFileDownload(response, pemAsBytes, user.WebAuthnDisplayName()+".pem", "application/x-pem-file")
+}
+
+type StartSigningRequest struct {
+	PDF []byte
+}
+
+type StartSigningResponse struct {
+	TransactionID     string
+	CredentialRequest protocol.CredentialAssertion
+}
+
+func (h *httpServer) startSign(response http.ResponseWriter, request *http.Request) {
+	user := h.getUserFromRequest(response, request)
+	if user == nil {
+		return
+	}
+	signingRequest := StartSigningRequest{}
+	if err := unmarshalJsonRequest(request, &signingRequest); err != nil {
+		handleError(response, err)
+		return
+	}
+	signer := pdf.NewOutOfBandPDFSigner(signingRequest.PDF, user.WebAuthnDisplayName(), "Signing reason", user.GetCertificate())
+	if dataToBeSigned, err := signer.Start(); err != nil {
+		handleError(response, fmt.Errorf("unable to start signing: %w", err))
+		return
+	} else {
+		transactionId := uuid.NewV4().String()
+		h.signingTransactions[transactionId] = signer
+
+		// Build WebAuthn credential request
+		var allowedCredentials = make([]protocol.CredentialDescriptor, 0)
+		for _, credential := range user.GetCredentials() {
+			var credentialDescriptor protocol.CredentialDescriptor
+			credentialDescriptor.CredentialID = credential.ID
+			credentialDescriptor.Type = protocol.PublicKeyCredentialType
+			allowedCredentials = append(allowedCredentials, credentialDescriptor)
+		}
+		requestOptions := protocol.PublicKeyCredentialRequestOptions{
+			Challenge:          protocol.Challenge(dataToBeSigned),
+			Timeout:            h.webAuthn.Config.Timeout,
+			RelyingPartyID:     h.webAuthn.Config.RPID,
+			UserVerification:   h.webAuthn.Config.AuthenticatorSelection.UserVerification,
+			AllowedCredentials: allowedCredentials,
+		}
+		_ = marshalResponse(response, StartSigningResponse{
+			TransactionID:     transactionId,
+			CredentialRequest: protocol.CredentialAssertion{Response: requestOptions},
+		})
+	}
+}
+
+func (h *httpServer) setSignature(response http.ResponseWriter, request *http.Request) {
+	user := h.getUserFromRequest(response, request)
+	if user == nil {
+		return
+	}
+	vars := mux.Vars(request)
+	transactionID := vars["transaction"]
+	if h.signingTransactions[transactionID] == nil {
+		handleError(response, fmt.Errorf("invalid signing transaction ID: %s", transactionID))
+		return
+	}
+	signature, err := base64.StdEncoding.DecodeString(request.PostFormValue("signature"))
+	if err != nil {
+		handleError(response, err)
+		return
+	}
+	if signedPDF, err := h.signingTransactions[transactionID].Complete(signature); err != nil {
+		handleError(response, err)
+		return
+	} else {
+		marshalFileDownload(response, signedPDF, "application/pdf", "signed.pdf")
+	}
+}
+
+func marshalFileDownload(response http.ResponseWriter, data []byte, contentType string, fileName string) {
+	response.Header().Add("Content-Type", contentType)
+	response.Header().Add("Content-Disposition", `attachment;filename="`+fileName+`"`)
 	response.WriteHeader(http.StatusOK)
-	_, _ = response.Write(pemAsBytes)
+	_, _ = response.Write(data)
+}
+
+func (h *httpServer) getUserFromRequest(response http.ResponseWriter, request *http.Request) users.User {
+	vars := mux.Vars(request)
+	if id, err := users.UserIDFromString(vars["id"]); err != nil {
+		handleError(response, fmt.Errorf("missing/invalid id: %w", err))
+		return nil
+	} else {
+		return h.users.Get(id)
+	}
 }
 
 func handleError(response http.ResponseWriter, err error) {

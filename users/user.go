@@ -43,6 +43,10 @@ func (u user) WebAuthnCredentials() []webauthn.Credential {
 	return append(u.credentials) // clones slice
 }
 
+func (u user) GetCredentials() []webauthn.Credential {
+	return append(u.credentials) // clones slice
+}
+
 func (u *user) AddCredential(credential webauthn.Credential) {
 	u.credentials = append(u.credentials, credential)
 }

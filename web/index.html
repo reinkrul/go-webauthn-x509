@@ -19,6 +19,15 @@ Username:
 <button onclick="loginUser()">Login</button>
 <button onclick="downloadCertificate()">Download certificate</button>
 
+<h2>PDF Signing</h2>
+<div>
+    Select PDF to sign: <input type="file" id="pdfToSign"/>
+    <button onclick="startSignPDF()">Sign PDF</button>
+</div>
+<form id="submitSignatureForm" method="POST">
+    <input type="hidden" id="pdfSignature" name="signature" />
+</form>
+
 <script>
 
     $(document).ready(function () {
@@ -33,17 +42,16 @@ Username:
     });
 
     // Base64 to ArrayBuffer
-    function bufferDecode(value) {
+    function urlBase64ToBuffer(value) {
         return Uint8Array.from(atob(value), c => c.charCodeAt(0));
     }
 
     // ArrayBuffer to URLBase64
-    function bufferEncode(value) {
+    function bufferToURLBase64(value) {
         return btoa(String.fromCharCode.apply(null, new Uint8Array(value)))
             .replace(/\+/g, "-")
             .replace(/\//g, "_")
             .replace(/=/g, "");
-        ;
     }
 
     function registerUser() {
@@ -58,12 +66,12 @@ Username:
         $.post('/registration', JSON.stringify({FullName: username}), data => data)
             .then((credentialCreationOptions) => {
                 console.log(credentialCreationOptions)
-                window.currentUserId = new Uint64BE(bufferDecode(credentialCreationOptions.publicKey.user.id).buffer).toString()
-                credentialCreationOptions.publicKey.challenge = bufferDecode(credentialCreationOptions.publicKey.challenge);
-                credentialCreationOptions.publicKey.user.id = bufferDecode(credentialCreationOptions.publicKey.user.id);
+                window.currentUserId = new Uint64BE(urlBase64ToBuffer(credentialCreationOptions.publicKey.user.id).buffer).toString()
+                credentialCreationOptions.publicKey.challenge = urlBase64ToBuffer(credentialCreationOptions.publicKey.challenge);
+                credentialCreationOptions.publicKey.user.id = urlBase64ToBuffer(credentialCreationOptions.publicKey.user.id);
                 if (credentialCreationOptions.publicKey.excludeCredentials) {
                     for (var i = 0; i < credentialCreationOptions.publicKey.excludeCredentials.length; i++) {
-                        credentialCreationOptions.publicKey.excludeCredentials[i].id = bufferDecode(credentialCreationOptions.publicKey.excludeCredentials[i].id);
+                        credentialCreationOptions.publicKey.excludeCredentials[i].id = urlBase64ToBuffer(credentialCreationOptions.publicKey.excludeCredentials[i].id);
                     }
                 }
 
@@ -81,11 +89,11 @@ Username:
                     '/registration/' + window.currentUserId,
                     JSON.stringify({
                         id: credential.id,
-                        rawId: bufferEncode(rawId),
+                        rawId: bufferToURLBase64(rawId),
                         type: credential.type,
                         response: {
-                            attestationObject: bufferEncode(attestationObject),
-                            clientDataJSON: bufferEncode(clientDataJSON),
+                            attestationObject: bufferToURLBase64(attestationObject),
+                            clientDataJSON: bufferToURLBase64(clientDataJSON),
                         },
                     }),
                     function (data) {
@@ -107,6 +115,46 @@ Username:
         window.location = '/user/' + window.currentUserId + '/certificate'
     }
 
+    function startSignPDF() {
+        let file = document.getElementById('pdfToSign').files[0];
+        if (file.type !== 'application/pdf') {
+            alert('Please select a PDF file.');
+            return;
+        }
+        const reader = new FileReader();
+        reader.addEventListener('load', (event) => {
+            let buf = event.target.result;
+            console.log('PDF file read, size: ' + buf.byteLength)
+            let pdfAsBase64 = btoa(new Uint8Array(buf).reduce(function (data, byte) {
+                return data + String.fromCharCode(byte);
+            }, ''));
+            $.post('/user/' + window.currentUserId + '/sign', JSON.stringify({PDF: pdfAsBase64}), (data) => data)
+                .then((response) => {
+                    console.log(response);
+                    signData(response.TransactionID, response.CredentialRequest);
+                })
+                .then((err) => {
+                    console.log(err)
+                })
+        });
+        reader.readAsArrayBuffer(file);
+    }
+
+    function signData(transactionID, credentialRequest) {
+        credentialRequest.publicKey.challenge = urlBase64ToBuffer(credentialRequest.publicKey.challenge)
+        credentialRequest.publicKey.allowCredentials[0].id = urlBase64ToBuffer(credentialRequest.publicKey.allowCredentials[0].id) // TODO: do not index
+        console.log(credentialRequest);
+        navigator.credentials.get(credentialRequest).then((assertion) => {
+            console.log('Signed DataToBeSigned')
+            console.log(assertion.response.signature)
+            document.getElementById('submitSignatureForm').action = '/user/' + window.currentUserId + '/sign/' + transactionID;
+            document.getElementById('pdfSignature').value = btoa(String.fromCharCode.apply(null, new Uint8Array(assertion.response.signature)));
+            document.getElementById('submitSignatureForm').submit();
+        }).then((err) => {
+            console.log(err);
+        });
+    }
+
     function loginUser() {
 
         username = $("#email").val()
@@ -124,9 +172,9 @@ Username:
             'json')
             .then((credentialRequestOptions) => {
                 console.log(credentialRequestOptions)
-                credentialRequestOptions.publicKey.challenge = bufferDecode(credentialRequestOptions.publicKey.challenge);
+                credentialRequestOptions.publicKey.challenge = urlBase64ToBuffer(credentialRequestOptions.publicKey.challenge);
                 credentialRequestOptions.publicKey.allowCredentials.forEach(function (listItem) {
-                    listItem.id = bufferDecode(listItem.id)
+                    listItem.id = urlBase64ToBuffer(listItem.id)
                 });
 
                 return navigator.credentials.get({
@@ -145,13 +193,13 @@ Username:
                     '/login/finish/' + username,
                     JSON.stringify({
                         id: assertion.id,
-                        rawId: bufferEncode(rawId),
+                        rawId: bufferToURLBase64(rawId),
                         type: assertion.type,
                         response: {
-                            authenticatorData: bufferEncode(authData),
-                            clientDataJSON: bufferEncode(clientDataJSON),
-                            signature: bufferEncode(sig),
-                            userHandle: bufferEncode(userHandle),
+                            authenticatorData: bufferToURLBase64(authData),
+                            clientDataJSON: bufferToURLBase64(clientDataJSON),
+                            signature: bufferToURLBase64(sig),
+                            userHandle: bufferToURLBase64(userHandle),
                         },
                     }),
                     function (data) {

@@ -39,6 +39,7 @@ type User interface {
 	AddCredential(credential webauthn.Credential)
 	AddCertificate(certificate *x509.Certificate)
 	GetCertificate() *x509.Certificate
+	GetCredentials() []webauthn.Credential
 }
 
 type Repository interface {
