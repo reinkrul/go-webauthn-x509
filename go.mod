@@ -3,6 +3,7 @@ module github.com/reinkrul/go-webauthn-certificate
 go 1.14
 
 require (
+	github.com/amdonov/xmlsig v0.1.0
 	github.com/duo-labs/webauthn v0.0.0-20190926021235-9562c88a0899
 	github.com/duo-labs/webauthn.io v0.0.0-20190926134215-35f44a73518f
 	github.com/google/go-tpm v0.1.0 // indirect

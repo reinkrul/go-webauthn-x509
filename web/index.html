@@ -19,13 +19,13 @@ Username:
 <button onclick="loginUser()">Login</button>
 <button onclick="downloadCertificate()">Download certificate</button>
 
-<h2>PDF Signing</h2>
+<h2>Document Signing</h2>
 <div>
-    Select PDF to sign: <input type="file" id="pdfToSign"/>
-    <button onclick="startSignPDF()">Sign PDF</button>
+    Select document (PDF or XML) to sign: <input type="file" id="documentToSign"/>
+    <button onclick="startSign()">Sign</button>
 </div>
 <form id="submitSignatureForm" method="POST">
-    <input type="hidden" id="pdfSignature" name="signature" />
+    <input type="hidden" id="signature" name="signature" />
 </form>
 
 <script>
@@ -115,20 +115,16 @@ Username:
         window.location = '/user/' + window.currentUserId + '/certificate'
     }
 
-    function startSignPDF() {
-        let file = document.getElementById('pdfToSign').files[0];
-        if (file.type !== 'application/pdf') {
-            alert('Please select a PDF file.');
-            return;
-        }
+    function startSign() {
+        let file = document.getElementById('documentToSign').files[0];
         const reader = new FileReader();
         reader.addEventListener('load', (event) => {
             let buf = event.target.result;
-            console.log('PDF file read, size: ' + buf.byteLength)
-            let pdfAsBase64 = btoa(new Uint8Array(buf).reduce(function (data, byte) {
+            console.log('Document to be signed read, size: ' + buf.byteLength)
+            let documentAsBase64 = btoa(new Uint8Array(buf).reduce(function (data, byte) {
                 return data + String.fromCharCode(byte);
             }, ''));
-            $.post('/user/' + window.currentUserId + '/sign', JSON.stringify({PDF: pdfAsBase64}), (data) => data)
+            $.post('/user/' + window.currentUserId + '/sign', JSON.stringify({document: documentAsBase64, type: file.type}), (data) => data)
                 .then((response) => {
                     console.log(response);
                     signData(response.TransactionID, response.CredentialRequest);
@@ -148,7 +144,7 @@ Username:
             console.log('Signed DataToBeSigned')
             console.log(assertion.response.signature)
             document.getElementById('submitSignatureForm').action = '/user/' + window.currentUserId + '/sign/' + transactionID;
-            document.getElementById('pdfSignature').value = btoa(String.fromCharCode.apply(null, new Uint8Array(assertion.response.signature)));
+            document.getElementById('signature').value = btoa(String.fromCharCode.apply(null, new Uint8Array(assertion.response.signature)));
             document.getElementById('submitSignatureForm').submit();
         }).then((err) => {
             console.log(err);

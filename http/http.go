@@ -15,7 +15,8 @@ import (
 	"github.com/gorilla/mux"
 	"github.com/gorilla/sessions"
 	"github.com/reinkrul/go-webauthn-certificate/ca"
-	"github.com/reinkrul/go-webauthn-certificate/pdf"
+	"github.com/reinkrul/go-webauthn-certificate/signing"
+	"github.com/reinkrul/go-webauthn-certificate/signing/types"
 	"github.com/reinkrul/go-webauthn-certificate/users"
 	uuid "github.com/satori/go.uuid"
 	"github.com/sirupsen/logrus"
@@ -35,7 +36,7 @@ func NewHTTPServer(name string, users users.Repository, ca ca.CertificateAuthori
 		address:             "localhost:8080",
 		users:               users,
 		ca:                  ca,
-		signingTransactions: make(map[string]*pdf.OutOfBandPDFSigner, 0),
+		signingTransactions: make(map[string]*signingTransaction, 0),
 	}
 	if host, _, err := net.SplitHostPort(server.address); err != nil {
 		return nil, err
@@ -60,9 +61,14 @@ type httpServer struct {
 	address             string
 	users               users.Repository
 	ca                  ca.CertificateAuthority
-	signingTransactions map[string]*pdf.OutOfBandPDFSigner
+	signingTransactions map[string]*signingTransaction
 	webAuthn            *webauthn.WebAuthn
 	sessions            sessions.Store
+}
+
+type signingTransaction struct {
+	documentType types.DocumentType
+	signer       *signing.OutOfBandDocumentSigner
 }
 
 func (h *httpServer) Start() {
@@ -172,7 +178,8 @@ func (h *httpServer) getCertificate(response http.ResponseWriter, request *http.
 }
 
 type StartSigningRequest struct {
-	PDF []byte
+	document     []byte
+	documentType string `json:"type"`
 }
 
 type StartSigningResponse struct {
@@ -190,13 +197,21 @@ func (h *httpServer) startSign(response http.ResponseWriter, request *http.Reque
 		handleError(response, err)
 		return
 	}
-	signer := pdf.NewOutOfBandPDFSigner(signingRequest.PDF, user.WebAuthnDisplayName(), "Signing reason", user.GetCertificate())
-	if dataToBeSigned, err := signer.Start(); err != nil {
+	transaction := signingTransaction{}
+	if documentType, ok := signing.DocumentTypes()[signingRequest.documentType]; ok {
+		transaction.documentType = documentType
+	} else {
+		handleError(response, fmt.Errorf("unsupported document type for signing: %s", signingRequest.documentType))
+		return
+	}
+
+	transaction.signer = signing.NewOutOfBandDocumentSigner(user.GetCertificate(), signingRequest.document)
+	if dataToBeSigned, err := transaction.signer.Start(transaction.documentType.Processor); err != nil {
 		handleError(response, fmt.Errorf("unable to start signing: %w", err))
 		return
 	} else {
 		transactionId := uuid.NewV4().String()
-		h.signingTransactions[transactionId] = signer
+		h.signingTransactions[transactionId] = &transaction
 
 		// Build WebAuthn credential request
 		var allowedCredentials = make([]protocol.CredentialDescriptor, 0)
@@ -227,7 +242,8 @@ func (h *httpServer) setSignature(response http.ResponseWriter, request *http.Re
 	}
 	vars := mux.Vars(request)
 	transactionID := vars["transaction"]
-	if h.signingTransactions[transactionID] == nil {
+	var transaction *signingTransaction
+	if transaction = h.signingTransactions[transactionID]; transaction == nil {
 		handleError(response, fmt.Errorf("invalid signing transaction ID: %s", transactionID))
 		return
 	}
@@ -236,11 +252,11 @@ func (h *httpServer) setSignature(response http.ResponseWriter, request *http.Re
 		handleError(response, err)
 		return
 	}
-	if signedPDF, err := h.signingTransactions[transactionID].Complete(signature); err != nil {
+	if signedDocument, err := transaction.signer.Complete(signature); err != nil {
 		handleError(response, err)
 		return
 	} else {
-		marshalFileDownload(response, signedPDF, "application/pdf", "signed.pdf")
+		marshalFileDownload(response, signedDocument, "application/pdf", "signed.pdf")
 	}
 }
 
